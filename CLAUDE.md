@@ -74,6 +74,7 @@ Skills are organized into **4 domains** with orchestrators that chain sub-skills
 | Skill | What It Does |
 |-------|-------------|
 | **abandoned-cart** | Fetches live examples from 5 sources, scores against brand, writes cart recovery email |
+| **campaign-score** | Scores Humanic campaign health 0–100 across delivery, engagement, and setup dimensions |
 | **email-preview** | Audits email HTML for cross-client rendering, generates client-safe code |
 | **humanic-auto** | Chains 4 AI models (Sonnet → Gemini → OpenAI → Opus) for best-possible email |
 | **re-engagement** | Creates a 3-email win-back sequence for lapsed users |

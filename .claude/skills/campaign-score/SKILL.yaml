@@ -1,0 +1,610 @@
+name: campaign-score
+version: "3.0.0"
+disable_model_invocation: false
+
+description:
+  short: >
+    Evaluates a Humanic email campaign using a two-pillar scoring framework
+    built exclusively on metrics the Humanic API actually returns. No
+    inferred scores, no silent gaps. Pillar 1: Delivery & Setup (40 pts)
+    — did the campaign reach anyone and is the infrastructure healthy?
+    Pillar 2: Engagement Quality (60 pts) — how are recipients responding?
+    Produces a 0–100 health score, a visual scorecard with █░ bars and
+    A–F grades, risk alerts, priority fixes ordered by point gain, a
+    What's Working section, and a single suggested action.
+  trigger_phrases:
+    - "score my campaign"
+    - "campaign health"
+    - "campaign score"
+    - "evaluate my campaign"
+    - "how healthy is my campaign"
+    - "check my campaign health"
+    - "campaign health score"
+    - "audit my campaign"
+    - "grade my campaign"
+    - "campaign performance score"
+    - "how is my campaign performing"
+    - "is my campaign in spam risk"
+    - "check campaign deliverability"
+  when_to_use: >
+    Use this skill when the user wants a structured, data-honest evaluation
+    of a Humanic campaign. Every score is computed from fields the Humanic
+    API actually returns — nothing is inferred or fabricated. Works on
+    draft, active, paused, or completed campaigns.
+
+mcp_tools_used:
+  - mcp__humanic__list_campaigns
+  - mcp__humanic__get_campaign
+  - mcp__humanic__get_campaign_analytics
+
+api_fields_used:
+  from_get_campaign_analytics:
+    - recipients        # total contacts targeted
+    - emails_sent       # handed off to provider
+    - emails_failed     # rejected by provider
+    - delivered         # confirmed delivered
+    - opened            # total opens
+    - clicked           # total clicks
+    - bounced           # total bounces (combined — no hard/soft split in API)
+    - complained        # spam complaints
+    - open_rate         # pre-computed by Humanic
+    - click_rate        # pre-computed by Humanic
+    - bounce_rate       # pre-computed by Humanic
+  from_get_campaign:
+    - sender_email
+    - sender_name       # can be null — scored in setup dimension
+    - email_provider    # gmail vs resend/sendgrid/ses — scored in setup
+    - steps_count
+    - steps[].delay_hours
+    - steps[].sequence_order
+    - steps[].name      # subject line
+
+  not_available_in_api:
+    - unsubscribe_count      # removed from scoring — field does not exist
+    - domain_reputation      # removed — replaced by Delivery Rate
+    - opens_by_device        # removed — no breakdown in API
+    - clicks_by_device       # removed — no breakdown in API
+    - opens_by_geo           # removed — no breakdown in API
+    - utm_coverage           # removed — not returned by API
+    - per_link_clicks        # removed — not returned by API
+    - hard_bounce_count      # removed — API returns combined bounced only
+    - soft_bounce_count      # removed — API returns combined bounced only
+    - time_series_data       # removed — single snapshot only
+
+scoring_model:
+  total_points: 100
+  formula: "Overall Score = Delivery & Setup (40 pts) + Engagement Quality (60 pts)"
+
+  pillar_1:
+    name: "Delivery & Setup"
+    total_points: 40
+    description: >
+      Did the campaign reach anyone and is the sending infrastructure
+      healthy? This pillar catches provider failures, setup gaps, and
+      cadence issues before engagement even matters.
+    dimensions:
+      - id: delivery_rate
+        name: "Delivery Rate"
+        points: 20
+        formula: "(delivered / recipients) * 100"
+        description: >
+          The single most critical signal. Measures what percentage of
+          targeted contacts actually received the email. Catches provider
+          failures, authentication issues, and bad list quality.
+        thresholds:
+          A: { min: 98,  points: 20, label: "Excellent" }
+          B: { min: 95,  points: 16, label: "Good" }
+          C: { min: 90,  points: 11, label: "Investigate" }
+          D: { min: 75,  points: 5,  label: "High risk" }
+          F: { min: 0,   points: 0,  label: "Critical — do not scale" }
+        edge_cases:
+          - "If recipients = 0: score 0, note campaign has no audience assigned"
+          - "If delivered > recipients: use delivered = recipients (data anomaly)"
+          - "If emails_failed = recipients: score 0, flag CRITICAL provider failure"
+
+      - id: sending_setup
+        name: "Sending Setup"
+        points: 10
+        description: >
+          Operational hygiene checklist scored from campaign config fields.
+          Penalises missing sender name, Gmail used as a bulk provider,
+          and non-zero failure counts.
+        checklist:
+          - check: "sender_name is not null and not empty"
+            points: 4
+            fail_flag: "MEDIUM — sender name missing, recipients see raw email address"
+          - check: "email_provider is not 'gmail'"
+            points: 4
+            fail_flag: "HIGH — Gmail is not designed for bulk marketing sends"
+            note: >
+              Compliant providers: resend, sendgrid, ses, postmark, mailgun.
+              Gmail flag triggers HIGH risk alert regardless of other scores.
+          - check: "emails_failed = 0"
+            points: 2
+            fail_flag: "Score pro-rated: 2 * (1 - emails_failed/recipients)"
+        scoring_note: >
+          Sum the points from all passing checks. Partial credit on the
+          failure check: if some but not all emails failed, award
+          round(2 * (1 - emails_failed/recipients)) points.
+
+      - id: sending_frequency
+        name: "Sending Frequency"
+        points: 10
+        description: >
+          Is the campaign cadence appropriate for the audience? Computed
+          from steps_count and delay_hours between steps.
+        formula: >
+          total_span_hours = sum of all delay_hours across steps
+          emails_per_week = steps_count / (total_span_hours / 168)
+          For single-step campaigns: emails_per_week = 1 (one-off)
+        thresholds:
+          A: { max_per_week: 1,   points: 10, label: "Well-spaced" }
+          B: { max_per_week: 3,   points: 7,  label: "Moderate" }
+          C: { max_per_week: 7,   points: 4,  label: "Elevated — monitor" }
+          D: { max_per_week: 14,  points: 2,  label: "High — risk of fatigue" }
+          F: { max_per_week: 999, points: 0,  label: "Excessive — spam risk" }
+        edge_cases:
+          - "Single-step campaigns score A by default (one-off send)"
+          - "If all delay_hours = 0 and steps > 1: flag as potentially sequential burst"
+
+  pillar_2:
+    name: "Engagement Quality"
+    total_points: 60
+    description: >
+      How are recipients responding once the email is delivered?
+      All metrics computed directly from Humanic API fields.
+    dimensions:
+      - id: open_rate
+        name: "Open Rate"
+        points: 20
+        formula: "Use pre-computed open_rate from API, or (opened / delivered) * 100"
+        description: "Subject line + sender trust signal. B2B SaaS benchmarks."
+        thresholds:
+          A: { min: 30,  points: 20, label: "Excellent" }
+          B: { min: 22,  points: 16, label: "Good — above B2B average" }
+          C: { min: 15,  points: 11, label: "Average" }
+          D: { min: 8,   points: 5,  label: "Poor" }
+          F: { min: 0,   points: 0,  label: "Critical" }
+        edge_cases:
+          - "If delivered = 0: score 0 with note 'No delivery — open rate unmeasurable'"
+
+      - id: click_rate
+        name: "Click Rate"
+        points: 15
+        formula: "Use pre-computed click_rate from API, or (clicked / delivered) * 100"
+        description: "Body copy + CTA effectiveness. B2B SaaS benchmarks."
+        thresholds:
+          A: { min: 5,   points: 15, label: "Excellent" }
+          B: { min: 3,   points: 12, label: "Good" }
+          C: { min: 1.5, points: 8,  label: "Average" }
+          D: { min: 0.5, points: 4,  label: "Poor" }
+          F: { min: 0,   points: 0,  label: "Critical" }
+        edge_cases:
+          - "If delivered = 0: score 0 with note 'No delivery — click rate unmeasurable'"
+
+      - id: ctor
+        name: "Click-to-Open Rate (CTOR)"
+        points: 10
+        formula: "(clicked / opened) * 100"
+        description: >
+          Body quality signal independent of subject line. Of people who
+          opened, how many clicked? Isolates whether the email earns the
+          click once it is open.
+        thresholds:
+          A: { min: 20, points: 10, label: "Excellent body + CTA" }
+          B: { min: 12, points: 8,  label: "Good" }
+          C: { min: 7,  points: 5,  label: "Average" }
+          D: { min: 3,  points: 2,  label: "Poor — body or CTA underperforming" }
+          F: { min: 0,  points: 0,  label: "Critical" }
+        edge_cases:
+          - "If opened = 0: score 0 with note 'No opens — CTOR unmeasurable'"
+
+      - id: bounce_rate
+        name: "Bounce Rate"
+        points: 10
+        formula: "Use pre-computed bounce_rate from API, or (bounced / emails_sent) * 100"
+        description: >
+          Combined bounce rate (API does not split hard vs soft).
+          Conservative thresholds applied since hard bounces are more
+          damaging and cannot be distinguished from soft.
+        thresholds:
+          A: { max: 0.5,  points: 10, label: "Excellent" }
+          B: { max: 1.5,  points: 8,  label: "Good" }
+          C: { max: 3.0,  points: 5,  label: "Average — monitor" }
+          D: { max: 5.0,  points: 2,  label: "Poor — list hygiene needed" }
+          F: { max: 100,  points: 0,  label: "Critical — sender reputation at risk" }
+        api_note: >
+          Hard/soft split not available in Humanic API. Thresholds are
+          set conservatively to account for the possibility that all
+          bounces are hard. Always flag if bounce_rate ≥ 2%.
+
+      - id: spam_complaint_rate
+        name: "Spam Complaint Rate"
+        points: 5
+        formula: "(complained / delivered) * 100"
+        description: >
+          Reputation risk signal. Google's threshold is 0.10% (warning)
+          and 0.30% (action taken). Yahoo enforces similar limits.
+        thresholds:
+          A: { max: 0.05, points: 5, label: "Excellent" }
+          B: { max: 0.08, points: 4, label: "Good" }
+          C: { max: 0.10, points: 2, label: "Warning — approaching Google threshold" }
+          D: { max: 0.30, points: 1, label: "High risk" }
+          F: { max: 100,  points: 0, label: "Critical — Google/Yahoo will act" }
+        escalation:
+          - "complained / delivered ≥ 0.10%: HIGH risk alert"
+          - "complained / delivered ≥ 0.30%: CRITICAL alert → force Pause recommendation"
+        edge_cases:
+          - "If delivered = 0: score 0 with note 'No delivery — complaint rate unmeasurable'"
+
+health_bands:
+  - label: "Excellent"
+    range: "90–100"
+    emoji: "🟢"
+    message: "Campaign is firing on all cylinders. Monitor and maintain."
+  - label: "Good"
+    range: "75–89"
+    emoji: "🟡"
+    message: "Strong performance with 1–2 dimensions worth optimising."
+  - label: "Average"
+    range: "55–74"
+    emoji: "🟠"
+    message: "Meaningful improvements available. Address lowest-scoring dimensions first."
+  - label: "Poor"
+    range: "35–54"
+    emoji: "🔴"
+    message: "Campaign needs significant work before scaling. Follow the priority fixes."
+  - label: "Critical"
+    range: "0–34"
+    emoji: "⛔"
+    message: "Campaign is underperforming severely. Remediate before further sends."
+
+grade_scale:
+  A: "≥ 90% of dimension max points"
+  B: "≥ 75% of dimension max points"
+  C: "≥ 55% of dimension max points"
+  D: "≥ 35% of dimension max points"
+  F: "< 35% of dimension max points"
+
+bar_rendering:
+  description: >
+    Render each dimension score as a 10-character block bar.
+    filled_blocks = round((score / max_points) * 10)
+    Use █ for filled, ░ for empty.
+  examples:
+    - "20/20 → ██████████"
+    - "16/20 → ████████░░"
+    - "11/20 → █████░░░░░"
+    - "5/20  → ██░░░░░░░░"
+    - "0/20  → ░░░░░░░░░░"
+
+risk_levels:
+  - level: "CRITICAL"
+    emoji: "⛔"
+    action: "Pause campaign immediately"
+    triggers:
+      - "Spam complaint rate ≥ 0.30%"
+      - "Delivery rate = 0% (all sends failed)"
+      - "emails_failed = recipients (100% failure)"
+  - level: "HIGH"
+    emoji: "🔴"
+    action: "Fix before next send"
+    triggers:
+      - "Spam complaint rate ≥ 0.10%"
+      - "Bounce rate ≥ 2%"
+      - "Delivery rate < 90%"
+      - "email_provider = gmail"
+  - level: "MEDIUM"
+    emoji: "🟠"
+    action: "Optimise before scaling"
+    triggers:
+      - "Open rate < 15%"
+      - "Click rate < 1.5%"
+      - "CTOR < 7%"
+      - "sender_name is null"
+      - "Bounce rate ≥ 1.5%"
+  - level: "LOW"
+    emoji: "🟡"
+    action: "Monitor"
+    triggers:
+      - "Any metric slightly below benchmark"
+
+suggested_actions:
+  - id: continue
+    label: "Continue"
+    condition: "Overall ≥ 80 and no HIGH or CRITICAL risks"
+  - id: optimize
+    label: "Optimize"
+    condition: "Overall 60–79 or MEDIUM risks present"
+    options:
+      - "Rewrite subject line with a specific stat or curiosity gap"
+      - "Move proof point above the CTA"
+      - "Set sender_name if missing"
+      - "Add delays between steps if frequency is high"
+  - id: reduce_volume
+    label: "Reduce Volume"
+    condition: "Bounce rate HIGH or delivery rate declining"
+    options:
+      - "Switch to a compliant bulk email provider"
+      - "Clean contact list — remove addresses causing bounces"
+      - "Ramp send volume gradually rather than full audience at once"
+  - id: modify_sequence
+    label: "Modify Sequence"
+    condition: "CTOR low despite good open rate"
+    options:
+      - "Rewrite CTA copy — make the action feel low-effort"
+      - "Move social proof above the CTA"
+      - "Remove a step that may be causing fatigue"
+  - id: pause
+    label: "Pause Campaign"
+    condition: "Overall < 40 or any CRITICAL risk"
+    options:
+      - "Pause immediately via Humanic"
+      - "Fix sending provider or authentication"
+      - "Clean contact list before resuming"
+      - "Wait 72 hours before resuming at reduced volume"
+
+instructions:
+  - step: 1
+    name: "Identify the Campaign"
+    content: |
+      Check if the user provided a campaign name or ID.
+      - If provided: call mcp__humanic__get_campaign directly with the ID,
+        or use mcp__humanic__list_campaigns to match by name.
+      - If not provided: call mcp__humanic__list_campaigns, show a numbered
+        list and ask the user to select one.
+
+      Load from mcp__humanic__get_campaign:
+        campaign_name, campaign_id, status, sender_email, sender_name,
+        email_provider, steps_count, steps[].delay_hours,
+        steps[].sequence_order, steps[].name (subject line)
+
+      Output:
+      ──────────────────────────────────────────
+      CAMPAIGN LOADED
+      Name:     [campaign_name]
+      ID:       [campaign_id]
+      Status:   [status]
+      Sender:   [sender_name or "⚠️ NOT SET"] <[sender_email]>
+      Provider: [email_provider]
+      Steps:    [steps_count]
+      ──────────────────────────────────────────
+
+  - step: 2
+    name: "Pull Analytics"
+    content: |
+      Call mcp__humanic__get_campaign_analytics with the campaign_id.
+
+      Map every returned field:
+        recipients       = [value]
+        emails_sent      = [value]
+        emails_failed    = [value]
+        delivered        = [value]
+        opened           = [value]
+        clicked          = [value]
+        bounced          = [value]
+        complained       = [value]
+        open_rate        = [value from API]
+        click_rate       = [value from API]
+        bounce_rate      = [value from API]
+
+      Compute derived metrics:
+        delivery_rate        = (delivered / recipients) * 100
+        ctor                 = (clicked / opened) * 100  [0 if opened = 0]
+        spam_complaint_rate  = (complained / delivered) * 100  [0 if delivered = 0]
+
+      If recipients = 0 or emails_sent = 0:
+        Flag: "No sends recorded. Analytics dimensions will score 0.
+               Setup and frequency dimensions will still score normally."
+
+  - step: 3
+    name: "Score Pillar 1 — Delivery & Setup (40 pts)"
+    content: |
+      DELIVERY RATE (max 20 pts):
+        delivery_rate: [value]%
+        Threshold band: [A/B/C/D/F]
+        Score: [pts]
+
+      SENDING SETUP (max 10 pts):
+        sender_name set:    [✅ +4 / ❌ 0]  sender_name = [value or null]
+        provider compliant: [✅ +4 / ❌ 0]  email_provider = [value]
+        zero failures:      [✅ +2 / partial / ❌ 0]
+          emails_failed = [value], pro-rated score = [pts]
+        Setup Score: [sum] / 10
+
+      SENDING FREQUENCY (max 10 pts):
+        Steps: [count]
+        Delays: [list of delay_hours per step]
+        Total span: [hours] = [days]
+        Estimated emails per contact per week: [value]
+        Threshold band: [A/B/C/D/F]
+        Score: [pts]
+
+      PILLAR 1 TOTAL: [sum] / 40
+
+  - step: 4
+    name: "Score Pillar 2 — Engagement Quality (60 pts)"
+    content: |
+      OPEN RATE (max 20 pts):
+        Value: [open_rate]%
+        Threshold band: [A/B/C/D/F]
+        Score: [pts]
+
+      CLICK RATE (max 15 pts):
+        Value: [click_rate]%
+        Threshold band: [A/B/C/D/F]
+        Score: [pts]
+
+      CTOR (max 10 pts):
+        Clicks: [clicked]   Opens: [opened]
+        CTOR: [ctor]%
+        Threshold band: [A/B/C/D/F]
+        Score: [pts]
+
+      BOUNCE RATE (max 10 pts):
+        Value: [bounce_rate]%
+        Note: Combined bounce (hard/soft not split in API)
+        Threshold band: [A/B/C/D/F]
+        Score: [pts]
+
+      SPAM COMPLAINT RATE (max 5 pts):
+        Complaints: [complained]   Delivered: [delivered]
+        Rate: [spam_complaint_rate]%
+        Threshold band: [A/B/C/D/F]
+        Score: [pts]
+
+      PILLAR 2 TOTAL: [sum] / 60
+
+  - step: 5
+    name: "Identify Risks"
+    content: |
+      Check every computed metric against risk_levels.
+      For each triggered risk output:
+
+      [emoji] [LEVEL] RISK — [Risk Name]
+      Triggered by: [metric name]: [value]
+      What it means: [1–2 sentences plain language]
+      Impact: [what happens if not addressed]
+      Action: [specific fix]
+
+      Apply escalation rules:
+        - spam_complaint_rate ≥ 0.30% → CRITICAL → Suggested Action = Pause (no override)
+        - delivery_rate = 0% → CRITICAL → Suggested Action = Pause (no override)
+        - email_provider = "gmail" → HIGH risk alert always
+
+      If no risks: output "No risk alerts. All signals within healthy thresholds."
+
+  - step: 6
+    name: "Output the Full Scorecard Report"
+    content: |
+      ═══════════════════════════════════════════════════════════
+      CAMPAIGN EVALUATION: [Campaign Name]
+      ═══════════════════════════════════════════════════════════
+
+      Overall Score:          [nn] / 100   [health emoji] [health label]
+      Delivery & Setup:       [nn] / 40
+      Engagement Quality:     [nn] / 60
+
+      [health band message]
+
+      ───────────────────────────────────────────────────────────
+      SCORECARD
+      ───────────────────────────────────────────────────────────
+
+      DELIVERY & SETUP (40 pts)
+      ┌──────────────────────────────────────────────────────────┐
+      │ Delivery Rate      [nn]/20   [grade]   [██████████]      │
+      │ Sending Setup      [nn]/10   [grade]   [██████████]      │
+      │ Sending Frequency  [nn]/10   [grade]   [██████████]      │
+      │ ─────────────────────────────────────────────────────    │
+      │ Pillar 1 Total     [nn]/40                               │
+      └──────────────────────────────────────────────────────────┘
+
+      ENGAGEMENT QUALITY (60 pts)
+      ┌──────────────────────────────────────────────────────────┐
+      │ Open Rate          [nn]/20   [grade]   [██████████]      │
+      │ Click Rate         [nn]/15   [grade]   [██████████]      │
+      │ CTOR               [nn]/10   [grade]   [██████████]      │
+      │ Bounce Rate        [nn]/10   [grade]   [██████████]      │
+      │ Spam Complaints    [nn]/5    [grade]   [██████████]      │
+      │ ─────────────────────────────────────────────────────    │
+      │ Pillar 2 Total     [nn]/60                               │
+      └──────────────────────────────────────────────────────────┘
+
+      OVERALL   [nn]/100   [health emoji] [health label]
+
+      ───────────────────────────────────────────────────────────
+      DATA USED
+      ───────────────────────────────────────────────────────────
+      All scores computed from live Humanic API data:
+        Recipients:   [n]   Delivered:  [n]   Failed:    [n]
+        Opened:       [n]   Clicked:    [n]   Bounced:   [n]
+        Complained:   [n]   Open rate:  [n]%  Click rate:[n]%
+        Delivery rate:[n]%  CTOR:       [n]%  Spam rate: [n]%
+
+      Not scored (field unavailable in Humanic API):
+        Unsubscribe rate · Hard/soft bounce split ·
+        Device breakdown · Geo breakdown · UTM coverage ·
+        Domain reputation · Time-series trend
+
+      ───────────────────────────────────────────────────────────
+      SUMMARY
+      ───────────────────────────────────────────────────────────
+      [2–4 sentences. What the overall picture is, top strength,
+      top risk. Plain language — no jargon.]
+
+      ───────────────────────────────────────────────────────────
+      RISKS
+      ───────────────────────────────────────────────────────────
+      [All risk alerts. If none: "No risk alerts detected."]
+
+      ───────────────────────────────────────────────────────────
+      PRIORITY FIXES  (highest point gain first)
+      ───────────────────────────────────────────────────────────
+
+      For each dimension scoring below B-grade, sorted by
+      (max_points − current_score) descending:
+
+      🔺 FIX [N] — [Dimension]   +[potential gain] pts available
+      Current: [score]/[max] pts   ([metric value])
+      Problem: [specific underperforming metric vs benchmark]
+      Root cause: [1 sentence]
+      Actions:
+        → [Specific step 1 tied to this campaign's actual data]
+        → [Specific step 2]
+        → [Tool or skill to invoke if applicable]
+
+      ───────────────────────────────────────────────────────────
+      WHAT'S WORKING  (protect these)
+      ───────────────────────────────────────────────────────────
+
+      [Every dimension at Grade A or B:]
+      ✅ [Dimension] — [score]/[max] pts   Grade [A/B]
+         [1-sentence note on what's driving this]
+
+      If none at A or B: "No dimensions at benchmark yet.
+      Prioritise the fixes above before scaling."
+
+      ───────────────────────────────────────────────────────────
+      SUGGESTED ACTION
+      ───────────────────────────────────────────────────────────
+      [Continue / Optimize / Reduce Volume / Modify Sequence / Pause]
+
+      Rationale: [1 sentence]
+
+      [If Pause or Reduce Volume:]
+      What to do right now:
+        1. [Step 1]
+        2. [Step 2]
+        3. [When to resume and at what volume]
+
+      ═══════════════════════════════════════════════════════════
+
+  - step: 7
+    name: "Offer Follow-On Actions"
+    content: |
+      Ask the user which of these they want to do next:
+
+      A) Fix the sending setup → update campaign via mcp__humanic__update_campaign
+      B) Pause the campaign → mcp__humanic__pause_campaign
+      C) Update email content → mcp__humanic__update_step_content
+      D) Re-score after changes → re-run this skill
+      E) Score another campaign → call mcp__humanic__list_campaigns
+      F) Done
+
+rules:
+  - "Score ONLY from fields the Humanic API actually returns — never infer or fabricate a metric"
+  - "Always show the DATA USED section so the user knows exactly what was measured vs skipped"
+  - "If recipients = 0 or emails_sent = 0: score all engagement dimensions 0 with a clear note — do not present 0 as poor performance"
+  - "If delivery_rate = 0% (all sends failed): Suggested Action MUST be Pause — no exceptions"
+  - "If spam_complaint_rate ≥ 0.30%: Suggested Action MUST be Pause — no exceptions"
+  - "email_provider = gmail always triggers a HIGH risk alert — it is never acceptable for bulk sends"
+  - "sender_name = null always triggers a MEDIUM alert — even if all other metrics are healthy"
+  - "Always render █░ bars — never skip the scorecard visualization"
+  - "Priority fixes sorted by (max_points − current_score) descending — highest gain listed first"
+  - "What's Working must list every A or B dimension — never omit a strong dimension"
+  - "Health band emoji and label must exactly match the total score against health_bands — never round up"
+  - "CTOR: if opened = 0, score 0 and note unmeasurable — do not divide by zero"
+  - "Bounce rate note: always state that hard/soft split is unavailable and thresholds are conservative as a result"
+  - "Never use overall email industry benchmarks — always use B2B SaaS lifecycle benchmarks"
+  - "Always offer follow-on actions after the report — do not end the session without asking what's next"
